@@ -31,7 +31,15 @@ BASE_URL        = "https://www.myscheme.gov.in/schemes/"
 
 def safe(val) -> str:
     """Convert cell value to string; return empty string for NaN."""
-    return "" if pd.isna(val) else str(val).strip()
+    # BUG FIX 3: unified safe() that also catches float NaN passed as object
+    if val is None:
+        return ""
+    try:
+        if pd.isna(val):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(val).strip()
 
 
 def tokenize(text: str) -> list:
@@ -82,8 +90,11 @@ def load_engine(
 ):
     """
     Load (or build) all search artefacts and return them as a tuple.
-    Automatically detects and fixes size mismatches between CSV, embeddings,
-    and FAISS index by rebuilding stale artefacts.
+
+    BUG FIX 1: Always rebuilds embeddings + FAISS index from scratch if
+    the downloaded files exist but were built from a different CSV version.
+    We do this by storing a checksum of the CSV alongside the embeddings,
+    and regenerating whenever the checksum doesn't match.
 
     Returns
     -------
@@ -92,6 +103,9 @@ def load_engine(
     index       : faiss.Index
     bm25        : BM25Okapi
     """
+    import hashlib
+
+    CHECKSUM_PATH = embeddings_path + ".csv_md5"
 
     # ── 1. Load CSV ───────────────────────────────────────────────────────────
     print(f"Loading CSV: {csv_path}")
@@ -103,23 +117,50 @@ def load_engine(
     df["search_text"] = df.apply(build_search_text, axis=1)
     print("  ✅ search_text column built")
 
+    # Compute CSV checksum to detect stale artefacts
+    with open(csv_path, "rb") as f:
+        csv_md5 = hashlib.md5(f.read()).hexdigest()
+
+    def _artefacts_are_fresh():
+        """Return True only if both files exist, row counts match, and CSV hasn't changed."""
+        if not os.path.exists(embeddings_path) or not os.path.exists(index_path):
+            return False
+        if not os.path.exists(CHECKSUM_PATH):
+            return False
+        with open(CHECKSUM_PATH) as f:
+            saved_md5 = f.read().strip()
+        if saved_md5 != csv_md5:
+            print("  ⚠️  CSV has changed since embeddings were built — rebuilding…")
+            return False
+        emb = np.load(embeddings_path)
+        if emb.shape[0] != num_rows:
+            print(f"  ⚠️  Row count mismatch (embeddings={emb.shape[0]}, CSV={num_rows}) — rebuilding…")
+            return False
+        idx = faiss.read_index(index_path)
+        if idx.ntotal != num_rows:
+            print(f"  ⚠️  Row count mismatch (FAISS={idx.ntotal}, CSV={num_rows}) — rebuilding…")
+            return False
+        return True
+
     # ── 2. Sentence-Transformer ───────────────────────────────────────────────
     print(f"\nLoading embedding model: {EMBED_MODEL}")
     embed_model = SentenceTransformer(EMBED_MODEL)
     print("  ✅ Embedding model ready")
 
-    # ── 3. Embeddings — rebuild if missing or row-count mismatch ─────────────
-    embeddings = None
-
-    if os.path.exists(embeddings_path):
+    # ── 3. Embeddings ─────────────────────────────────────────────────────────
+    if _artefacts_are_fresh():
         print(f"\nLoading saved embeddings: {embeddings_path}")
         embeddings = np.load(embeddings_path)
-        if embeddings.shape[0] != num_rows:
-            print(f"  ⚠️  Mismatch: embeddings={embeddings.shape[0]} rows, CSV={num_rows} rows — rebuilding…")
-            os.remove(embeddings_path)
-            embeddings = None
+        print(f"  ✅ Embeddings ready — shape: {embeddings.shape}")
+        print(f"\nLoading saved FAISS index: {index_path}")
+        index = faiss.read_index(index_path)
+        print(f"  ✅ FAISS index ready — {index.ntotal:,} vectors")
+    else:
+        # Remove stale files
+        for path in [embeddings_path, index_path, CHECKSUM_PATH]:
+            if os.path.exists(path):
+                os.remove(path)
 
-    if embeddings is None:
         print(f"\nGenerating embeddings for {num_rows:,} rows (~2–5 min on CPU)…")
         embeddings = embed_model.encode(
             df["search_text"].tolist(),
@@ -131,20 +172,6 @@ def load_engine(
         np.save(embeddings_path, embeddings)
         print(f"  ✅ Embeddings saved — shape: {embeddings.shape}")
 
-    print(f"  ✅ Embeddings ready — shape: {embeddings.shape}")
-
-    # ── 4. FAISS index — rebuild if missing or row-count mismatch ────────────
-    index = None
-
-    if os.path.exists(index_path):
-        print(f"\nLoading saved FAISS index: {index_path}")
-        index = faiss.read_index(index_path)
-        if index.ntotal != num_rows:
-            print(f"  ⚠️  Mismatch: FAISS={index.ntotal} vectors, CSV={num_rows} rows — rebuilding…")
-            os.remove(index_path)
-            index = None
-
-    if index is None:
         print("\nBuilding FAISS index…")
         dim   = embeddings.shape[1]
         index = faiss.IndexFlatIP(dim)
@@ -152,9 +179,11 @@ def load_engine(
         faiss.write_index(index, index_path)
         print(f"  ✅ FAISS index saved — {index.ntotal:,} vectors")
 
-    print(f"  ✅ FAISS index ready — {index.ntotal:,} vectors")
+        # Save checksum so next run knows these artefacts match this CSV
+        with open(CHECKSUM_PATH, "w") as f:
+            f.write(csv_md5)
 
-    # ── 5. BM25 index ─────────────────────────────────────────────────────────
+    # ── 4. BM25 index ─────────────────────────────────────────────────────────
     print("\nBuilding BM25 index…")
     tokenized_corpus = [tokenize(t) for t in df["search_text"]]
     bm25 = BM25Okapi(tokenized_corpus)
@@ -175,6 +204,7 @@ def fuzzy_name_match(
     Catches misspellings like 'pradan' → 'Pradhan'.
     """
     query_clean  = query.strip().lower()
+    num_rows     = len(df)
     scheme_names = df["scheme_name"].fillna("").tolist()
 
     matches = process.extract(
@@ -186,7 +216,8 @@ def fuzzy_name_match(
 
     results, seen = [], set()
     for _match_text, score, idx in matches:
-        if idx in seen or score < 40:
+        # BUG FIX 2: guard against out-of-bound indices from rapidfuzz
+        if idx in seen or score < 40 or idx >= num_rows:
             continue
         seen.add(idx)
         row = df.iloc[idx]
@@ -268,6 +299,7 @@ def hybrid_search(
             "rank":                None,
             "similarity":          round(float(score), 4),
             "match_type":          "semantic",
+            # BUG FIX 3: all fields go through safe() — no raw .get() without NaN guard
             "scheme_name":         safe(row.get("scheme_name",         "")),
             "scheme_name_hindi":   safe(row.get("scheme_name_hindi",   "")),
             "scheme_name_kannada": safe(row.get("scheme_name_kannada", "")),
