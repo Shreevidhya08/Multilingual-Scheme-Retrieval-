@@ -24,7 +24,21 @@ st.set_page_config(
 
 @st.cache_resource(show_spinner="Loading search engine…")
 def get_engine():
-    """Load CSV, embeddings, FAISS index and BM25 — cached across reruns."""
+    import urllib.request
+
+    BASE = "https://huggingface.co/datasets/Shree0804/Multilingual_Government_Schemes_Dataset/tree/main"
+
+    files = {
+        "data/finalized_data.csv": f"{BASE}/finalized_data.csv",
+        "scheme_embeddings.npy":   f"{BASE}/scheme_embeddings.npy",
+        "scheme_faiss.index":      f"{BASE}/scheme_faiss.index",
+    }
+
+    for local_path, url in files.items():
+        if not os.path.exists(local_path) or os.path.getsize(local_path) < 1000:
+            os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+            urllib.request.urlretrieve(url, local_path)
+
     return load_engine(
         "data/finalized_data.csv",
         "scheme_embeddings.npy",
