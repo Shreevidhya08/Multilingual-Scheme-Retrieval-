@@ -6,5 +6,3 @@ pandas
 rank_bm25
 rapidfuzz
 openai-whisper
-sounddevice
-scipy
