@@ -26,7 +26,7 @@ st.set_page_config(
 def get_engine():
     import urllib.request
 
-    BASE = "https://huggingface.co/datasets/Shree0804/Multilingual_Government_Schemes_Dataset/tree/main"
+    BASE = "https://huggingface.co/datasets/Shree0804/Multilingual_Government_Schemes_Dataset/resolve/main"
 
     files = {
         "data/finalized_data.csv": f"{BASE}/finalized_data.csv",
@@ -37,7 +37,13 @@ def get_engine():
     for local_path, url in files.items():
         if not os.path.exists(local_path) or os.path.getsize(local_path) < 1000:
             os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
-            urllib.request.urlretrieve(url, local_path)
+            try:
+                st.write(f"⬇️ Downloading `{local_path}`…")
+                urllib.request.urlretrieve(url, local_path)
+                st.write(f"✅ {os.path.getsize(local_path):,} bytes")
+            except urllib.error.HTTPError as e:
+                st.error(f"❌ HTTP {e.code} — check the file exists and the dataset is Public")
+                st.stop()
 
     return load_engine(
         "data/finalized_data.csv",
