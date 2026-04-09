@@ -1,0 +1,10 @@
+streamlit>=1.35
+sentence-transformers
+faiss-cpu
+numpy
+pandas
+rank_bm25
+rapidfuzz
+openai-whisper
+sounddevice
+scipy
